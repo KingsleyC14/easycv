@@ -1,0 +1,19 @@
+# Environment variables
+.env
+
+# Node modules
+node_modules/
+
+# Lock file
+package-lock.json
+
+# Build artifacts
+build/
+dist/
+
+# Logs
+*.log
+
+# VS Code specific files (excluding extensions.json if you want to share recommendations)
+.vscode/*
+!.vscode/extensions.json 

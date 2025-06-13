@@ -1,0 +1,17 @@
+{
+  "name": "easycv-root",
+  "version": "1.0.0",
+  "description": "Full-stack web app for tailoring CVs using OpenAI, React, and Supabase.",
+  "main": "index.js",
+  "scripts": {
+    "postinstall": "cd backend && npm install && cd .. && cd frontend && npm install && cd ..",
+    "start": "concurrently \"node backend/server.js\" \"npm run dev --prefix frontend\"",
+    "setup-and-start": "npm install && npm start"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+} 
