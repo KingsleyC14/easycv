@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Curriculum Vitae</title>
+    <style>
+        body {
+            font-family: 'Times New Roman', Times, serif;
+            margin: 0;
+            padding: 20mm; /* A4 paper default margins usually around 20mm */
+            font-size: 11pt;
+            line-height: 1.2;
+            color: #333;
+        }
+        h1 {
+            font-size: 20pt;
+            text-align: center;
+            margin-bottom: 5px;
+            color: #222;
+        }
+        .contact-info {
+            text-align: center;
+            font-size: 10pt;
+            margin-bottom: 20px;
+            color: #555;
+        }
+        .contact-info span {
+            margin: 0 5px;
+        }
+        .contact-info a {
+            color: #007bff; /* Standard link blue */
+            text-decoration: none;
+        }
+        .section-title {
+            font-size: 14pt;
+            font-weight: bold;
+            margin-top: 20px;
+            margin-bottom: 5px;
+            padding-bottom: 2px;
+            border-bottom: 1.5px solid #222;
+        }
+        .section-content {
+            margin-bottom: 15px;
+        }
+        .summary-text {
+            margin-bottom: 10px;
+        }
+        .education-entry, .experience-entry {
+            margin-bottom: 10px;
+            padding-left: 0;
+        }
+        .education-entry div, .experience-entry div {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            margin-bottom: 2px;
+        }
+        .education-degree, .experience-title {
+            font-weight: bold;
+            flex-shrink: 1;
+            margin-right: 10px;
+        }
+        .education-institution, .experience-company {
+            font-style: italic;
+            flex-shrink: 1;
+        }
+        .education-date, .experience-date {
+            font-size: 10pt;
+            flex-shrink: 0;
+            white-space: nowrap;
+        }
+        ul {
+            list-style-type: disc;
+            margin-left: 20px;
+            padding-left: 0;
+            margin-top: 5px;
+        }
+        ul li {
+            margin-bottom: 3px;
+        }
+        .skills-category {
+            font-weight: bold;
+            margin-top: 10px;
+            display: inline-block;
+            margin-right: 5px;
+        }
+        .skills-list {
+            margin: 0 0 0 20px;
+            padding: 0;
+        }
+        .skills-list li {
+            margin-bottom: 3px;
+        }
+        address {
+            font-style: normal; /* Override default italic for address tag */
+        }
+    </style>
+</head>
+<body>
+    <div id="cv-container">
+        <h1>{{full_name}}</h1>
+        <div class="contact-info">
+            <address>{{address}}</address> | <span>{{email}}</span> | <span>{{phone_number}}</span>
+            {{#if linkedin_url}}<br/><a href="{{linkedin_url}}">{{linkedin_url}}</a>{{/if}}
+            {{#if portfolio_github_url}}<br/><a href="{{portfolio_github_url}}">{{portfolio_github_url}}</a>{{/if}}
+        </div>
+
+        <div class="section-title">Professional Summary</div>
+        <div class="section-content summary-text">
+            {{summary}}
+        </div>
+
+        <div class="section-title">Education</div>
+        <div class="section-content">
+            {{#each education}}
+            <div class="education-entry">
+                <div style="display: flex; justify-content: space-between; align-items: baseline;">
+                    <span class="education-institution" style="font-weight: bold;">{{university_name}}</span>
+                    <span class="education-date">{{start_date}} – {{end_date}}</span>
+                </div>
+                <ul>
+                    <li><span class="education-degree">{{degree_name}}</span>{{#if location}}, {{location}}{{/if}}</li>
+                    {{#each details}}
+                    <li>{{this}}</li>
+                    {{/each}}
+                </ul>
+            </div>
+            {{/each}}
+        </div>
+
+        <div class="section-title">Experience</div>
+        <div class="section-content">
+            {{#each experience}}
+            <div class="experience-entry">
+                <div>
+                    <span class="experience-title">{{job_title}}</span>
+                </div>
+                <div style="display: flex; justify-content: space-between; align-items: baseline;">
+                    <span>at <span class="experience-company">{{company_name}}</span></span>
+                    <span class="experience-date">{{start_date}} – {{end_date}}</span>
+                </div>
+                {{#if location}}<div>{{location}}</div>{{/if}}
+                <ul>
+                    {{#each achievements}}
+                    <li>{{this}}</li>
+                    {{/each}}
+                </ul>
+            </div>
+            {{/each}}
+        </div>
+
+        <div class="section-title">Skills</div>
+        <div class="section-content">
+            {{#if technical_skills}}
+            <div><span class="skills-category">Technical Skills:</span>
+                <ul class="skills-list">
+                {{#each technical_skills}}
+                    <li>{{this}}</li>
+                {{/each}}
+                </ul>
+            </div>
+            {{/if}}
+            {{#if soft_skills}}
+            <div><span class="skills-category">Soft Skills:</span>
+                <ul class="skills-list">
+                {{#each soft_skills}}
+                    <li>{{this}}</li>
+                {{/each}}
+                </ul>
+            </div>
+            {{/if}}
+        </div>
+    </div>
+</body>
+</html> 

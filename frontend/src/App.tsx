@@ -83,33 +83,36 @@ function App() {
       return
     }
 
-    // For demonstration, we'll fetch the original CV and job spec text from the backend
-    // In a real application, you might want to parse the CV and job spec content
-    // on the backend when they are uploaded, or use a client-side parser.
     try {
-      const submissionResponse = await axios.get(`http://localhost:5000/submission/${submissionId}`)
-      const { original_cv_url, job_spec_text } = submissionResponse.data
-
-      // NOTE: For a real application, you would need to parse the content of the CV file (e.g., PDF, DOCX)
-      // and the job spec file (if uploaded) into plain text before sending to OpenAI.
-      // This example assumes original_cv_url points to a readable text or that you'll implement a file parser on backend.
-      // For now, we'll use a placeholder for originalCvContent.
-
-      // If job_spec was uploaded as a file, job_spec_text might be raw buffer data.
-      // In a real app, you'd process it on the backend (e.g., OCR for images, text extraction for docx/pdf).
-      const parsedJobSpecContent = job_spec_text // Placeholder for actual parsing
-      const parsedOriginalCvContent = "[Content of original CV - implement file parsing on backend]" // Placeholder
-
-      const response = await axios.post('http://localhost:5000/tailor-cv', {
+      // Request the PDF directly from the backend
+      const response = await axios.post(`http://localhost:5000/tailor-cv`, {
         submissionId,
-        originalCvContent: parsedOriginalCvContent,
-        jobSpecContent: parsedJobSpecContent,
+        // originalCvContent and jobSpecContent are now fetched on backend
+      }, {
+        responseType: 'blob' // Important: expect a binary response
       })
-      setTailoredCv(response.data.tailoredCv)
-      setMessage(response.data.message)
+
+      // Create a blob from the response data
+      const blob = new Blob([response.data], { type: 'application/pdf' })
+      const downloadUrl = window.URL.createObjectURL(blob)
+
+      // Create a link element and trigger the download
+      const link = document.createElement('a')
+      link.href = downloadUrl
+      link.setAttribute('download', 'tailored_cv.pdf') // Set the download filename
+      document.body.appendChild(link)
+      link.click()
+
+      // Clean up
+      link.remove()
+      window.URL.revokeObjectURL(downloadUrl)
+
+      setMessage('CV tailored and PDF downloaded successfully!')
+      setTailoredCv(null) // Clear previous tailored CV display
+
     } catch (err: any) {
       console.error('Tailor CV error:', err)
-      setError(err.response?.data?.error || 'Failed to tailor CV.')
+      setError(err.response?.data?.error || 'Failed to tailor CV and download PDF.')
     } finally {
       setLoading(false)
     }
