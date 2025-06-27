@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
 const multer = require('multer');
 const { createClient } = require('@supabase/supabase-js');
 const { createOpenRouter } = require('@openrouter/ai-sdk-provider');
@@ -12,29 +13,93 @@ const fs = require('fs').promises; // New import for file system operations
 const Handlebars = require('handlebars'); // New import for templating
 const path = require('path'); // New import for path operations
 
-const app = express();
-const port = process.env.PORT || 5000;
+// Import security middleware
+const { validateEnvironment, config } = require('./middleware/config');
+const { logger, requestLogger, errorLogger, securityLogger } = require('./middleware/logger');
+const {
+  uploadLimiter,
+  tailorLimiter,
+  fileFilter,
+  fileSizeLimits,
+  validateUpload,
+  validateTailorCv,
+  handleValidationErrors,
+  errorHandler,
+  sanitizeRequest
+} = require('./middleware/security');
 
-// Supabase Client
-const supabaseProjectUrl = process.env.SUPABASE_PROJECT_URL;
-const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
-const supabase = createClient(supabaseProjectUrl, supabaseAnonKey);
+// Import scalability middleware
+const { cacheMiddleware, cacheUtils, checkRedisHealth } = require('./middleware/cache');
+const { supabase, dbUtils, dbMetrics, dbMiddleware } = require('./middleware/database');
+const { queueUtils, gracefulShutdown: queueShutdown } = require('./middleware/queue');
+const { 
+  healthCheckMiddleware, 
+  healthEndpoints, 
+  scheduleHealthChecks 
+} = require('./middleware/health');
+
+// Validate environment variables before starting
+try {
+  validateEnvironment();
+} catch (error) {
+  console.error('❌ Environment validation failed:', error.message);
+  process.exit(1);
+}
+
+const app = express();
+const port = config.port;
+
+// Security middleware
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      scriptSrc: ["'self'"],
+      imgSrc: ["'self'", "data:", "https:"],
+    },
+  },
+  crossOriginEmbedderPolicy: false, // Allow PDF generation
+}));
+
+// CORS configuration
+app.use(cors({
+  origin: config.security.corsOrigin,
+  credentials: true,
+  methods: ['GET', 'POST'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
+
+// Request size limits
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Logging middleware
+app.use(requestLogger);
+
+// Health check middleware
+app.use(healthCheckMiddleware);
+
+// Database middleware
+app.use(dbMiddleware);
+
+// Request sanitization
+app.use(sanitizeRequest);
+
+// Multer configuration with security
+const storage = multer.memoryStorage();
+const upload = multer({
+  storage: storage,
+  fileFilter: fileFilter,
+  limits: {
+    fileSize: Math.max(fileSizeLimits.cv, fileSizeLimits.job_spec),
+    files: 2, // Maximum 2 files (cv + job_spec)
+  }
+});
 
 // OpenRouter Client
 const openrouter = createOpenRouter({
-  apiKey: process.env.OPENROUTER_API_KEY,
-});
-
-// Multer for file uploads
-const storage = multer.memoryStorage(); // Store files in memory
-const upload = multer({ storage: storage });
-
-// Middleware
-app.use(cors());
-app.use(express.json());
-
-app.get('/', (req, res) => {
-  res.send('EasyCV Backend is running!');
+  apiKey: config.openrouter.apiKey,
 });
 
 // Basic CV Template (now describes desired JSON output structure for AI)
@@ -82,7 +147,7 @@ async function parsePdf(buffer) {
     const data = await pdfParse(buffer);
     return data.text;
   } catch (error) {
-    console.error('Error parsing PDF:', error);
+    logger.error('Error parsing PDF:', { error: error.message });
     return null;
   }
 }
@@ -93,134 +158,196 @@ async function parseDocx(buffer) {
     const { value } = await mammoth.extractRawText({ arrayBuffer: buffer });
     return value;
   } catch (error) {
-    console.error('Error parsing DOCX:', error);
+    logger.error('Error parsing DOCX:', { error: error.message });
     return null;
   }
 }
 
+// Health check endpoints
+app.get('/health', healthEndpoints.basic);
+app.get('/health/database', healthEndpoints.database);
+app.get('/health/redis', healthEndpoints.redis);
+app.get('/health/queue', healthEndpoints.queue);
+app.get('/health/system', healthEndpoints.system);
+app.get('/health/comprehensive', healthEndpoints.comprehensive);
+app.get('/metrics', healthEndpoints.metrics);
+
+// Enhanced health check endpoint
+app.get('/', (req, res) => {
+  res.json({ 
+    message: 'EasyCV Backend is running!',
+    version: '1.0.0',
+    environment: config.nodeEnv,
+    timestamp: new Date().toISOString(),
+    worker: process.pid
+  });
+});
+
 // API Endpoints
 
 // Endpoint to upload CV and Job Spec
-app.post('/upload', upload.fields([{ name: 'cv', maxCount: 1 }, { name: 'job_spec', maxCount: 1 }]), async (req, res) => {
-  try {
-    const { cv, job_spec } = req.files;
-    const { job_spec_text_input } = req.body; // For direct text input of job spec
+app.post('/upload', 
+  uploadLimiter,
+  upload.fields([{ name: 'cv', maxCount: 1 }, { name: 'job_spec', maxCount: 1 }]),
+  validateUpload,
+  handleValidationErrors,
+  async (req, res) => {
+    try {
+      const { cv, job_spec } = req.files;
+      const { job_spec_text_input } = req.body;
 
-    if (!cv || cv.length === 0) {
-      return res.status(400).json({ error: 'CV file is required.' });
-    }
+      if (!cv || cv.length === 0) {
+        securityLogger.failedUpload(req, 'CV file missing');
+        return res.status(400).json({ error: 'CV file is required.' });
+      }
 
-    let original_cv_text = null;
-    if (cv[0].mimetype === 'application/pdf') {
-      original_cv_text = await parsePdf(cv[0].buffer);
-    } else if (cv[0].mimetype === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
-      original_cv_text = await parseDocx(cv[0].buffer);
-    } else {
-      // Fallback for other text-based files if needed, or return an error
-      original_cv_text = cv[0].buffer.toString('utf8');
-    }
+      // Validate CV file size
+      if (cv[0].size > fileSizeLimits.cv) {
+        securityLogger.failedUpload(req, 'CV file too large');
+        return res.status(400).json({ 
+          error: 'CV file too large.',
+          details: `Maximum size: ${fileSizeLimits.cv / (1024 * 1024)}MB`
+        });
+      }
 
-    if (original_cv_text === null) {
-      return res.status(400).json({ error: 'Unsupported CV file format or parsing failed.' });
-    }
-
-    // Upload CV to Supabase Storage
-    const cvFileName = `cvs/${Date.now()}-${cv[0].originalname}`;
-    const { data: cvUploadData, error: cvUploadError } = await supabase.storage
-      .from('easycv-files') // Create this bucket in Supabase Storage
-      .upload(cvFileName, cv[0].buffer, { contentType: cv[0].mimetype });
-
-    if (cvUploadError) {
-      console.error('Error uploading CV:', cvUploadError);
-      return res.status(500).json({ error: 'Failed to upload CV.' });
-    }
-    const { data: { publicUrl: original_cv_url } } = supabase.storage.from('easycv-files').getPublicUrl(cvFileName);
-
-    let job_spec_content = job_spec_text_input;
-    let job_spec_file_text = null; // New variable for extracted job spec text
-
-    if (job_spec && job_spec.length > 0) {
-      // Determine job spec content based on file type or text input
-      if (job_spec[0].mimetype === 'application/pdf') {
-        job_spec_file_text = await parsePdf(job_spec[0].buffer);
-      } else if (job_spec[0].mimetype === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
-        job_spec_file_text = await parseDocx(job_spec[0].buffer);
+      let original_cv_text = null;
+      if (cv[0].mimetype === 'application/pdf') {
+        original_cv_text = await parsePdf(cv[0].buffer);
+      } else if (cv[0].mimetype === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
+        original_cv_text = await parseDocx(cv[0].buffer);
       } else {
-        // Fallback for other text-based files or direct content
-        job_spec_file_text = job_spec[0].buffer.toString('utf8');
+        original_cv_text = cv[0].buffer.toString('utf8');
       }
 
-      if (job_spec_file_text === null) {
-        return res.status(400).json({ error: 'Unsupported Job Spec file format or parsing failed.' });
+      if (original_cv_text === null) {
+        securityLogger.failedUpload(req, 'CV parsing failed');
+        return res.status(400).json({ error: 'Unsupported CV file format or parsing failed.' });
       }
 
-      // Upload Job Spec to Supabase Storage
-      const jobSpecFileName = `job_specs/${Date.now()}-${job_spec[0].originalname}`;
-      const { data: jobSpecUploadData, error: jobSpecUploadError } = await supabase.storage
-        .from('easycv-files')
-        .upload(jobSpecFileName, job_spec[0].buffer, { contentType: job_spec[0].mimetype });
+      // Upload CV to Supabase Storage with retry
+      const cvFileName = `cvs/${Date.now()}-${cv[0].originalname}`;
+      const cvUploadData = await dbUtils.uploadFileWithRetry(
+        config.upload.storageBucket,
+        cvFileName,
+        cv[0].buffer,
+        cv[0].mimetype
+      );
 
-      if (jobSpecUploadError) {
-        console.error('Error uploading job spec:', jobSpecUploadError);
-        return res.status(500).json({ error: 'Failed to upload job spec.' });
+      const original_cv_url = await dbUtils.getFileUrl(config.upload.storageBucket, cvFileName);
+
+      let job_spec_content = job_spec_text_input;
+      let job_spec_file_text = null;
+
+      if (job_spec && job_spec.length > 0) {
+        // Validate job spec file size
+        if (job_spec[0].size > fileSizeLimits.job_spec) {
+          securityLogger.failedUpload(req, 'Job spec file too large');
+          return res.status(400).json({ 
+            error: 'Job spec file too large.',
+            details: `Maximum size: ${fileSizeLimits.job_spec / (1024 * 1024)}MB`
+          });
+        }
+
+        if (job_spec[0].mimetype === 'application/pdf') {
+          job_spec_file_text = await parsePdf(job_spec[0].buffer);
+        } else if (job_spec[0].mimetype === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
+          job_spec_file_text = await parseDocx(job_spec[0].buffer);
+        } else {
+          job_spec_file_text = job_spec[0].buffer.toString('utf8');
+        }
+
+        if (job_spec_file_text === null) {
+          securityLogger.failedUpload(req, 'Job spec parsing failed');
+          return res.status(400).json({ error: 'Unsupported Job Spec file format or parsing failed.' });
+        }
+
+        // Upload Job Spec to Supabase Storage with retry
+        const jobSpecFileName = `job_specs/${Date.now()}-${job_spec[0].originalname}`;
+        await dbUtils.uploadFileWithRetry(
+          config.upload.storageBucket,
+          jobSpecFileName,
+          job_spec[0].buffer,
+          job_spec[0].mimetype
+        );
       }
-      const { data: { publicUrl: job_spec_url_data } } = supabase.storage.from('easycv-files').getPublicUrl(jobSpecFileName);
-      job_spec_url = job_spec_url_data;
+
+      // Insert submission into database with timeout
+      const submissionData = await dbUtils.queryWithTimeout(async () => {
+        const { data, error } = await supabase
+          .from('cv_submissions')
+          .insert({
+            original_cv_url,
+            original_cv_text,
+            job_spec_text: job_spec_content || job_spec_file_text,
+            status: 'uploaded',
+          })
+          .select();
+
+        if (error) throw error;
+        return data;
+      });
+
+      // Cache submission data
+      await cacheUtils.cacheSubmission(submissionData[0].id, submissionData[0]);
+
+      logger.info('File upload successful', { 
+        submissionId: submissionData[0].id,
+        ip: req.ip,
+        fileTypes: {
+          cv: cv[0].mimetype,
+          jobSpec: job_spec ? job_spec[0].mimetype : 'text'
+        }
+      });
+
+      res.status(200).json({ message: 'Files uploaded and submission created successfully!', data: submissionData });
+    } catch (error) {
+      logger.error('Server error during upload:', { error: error.message, stack: error.stack });
+      res.status(500).json({ error: 'Internal server error.' });
     }
-
-    // Insert submission into database
-    const { data, error } = await supabase
-      .from('cv_submissions')
-      .insert({
-        original_cv_url,
-        original_cv_text, // Save extracted CV text
-        job_spec_text: job_spec_content || job_spec_file_text, // Use text input or extracted file text
-        status: 'uploaded',
-      })
-      .select();
-
-    if (error) {
-      console.error('Error inserting into DB:', error);
-      return res.status(500).json({ error: 'Failed to save submission.' });
-    }
-
-    res.status(200).json({ message: 'Files uploaded and submission created successfully!', data });
-  } catch (error) {
-    console.error('Server error during upload:', error);
-    res.status(500).json({ error: 'Internal server error.' });
   }
-});
+);
 
 // Endpoint to tailor CV
-app.post('/tailor-cv', async (req, res) => {
-  const { submissionId } = req.body;
+app.post('/tailor-cv',
+  tailorLimiter,
+  validateTailorCv,
+  handleValidationErrors,
+  async (req, res) => {
+    const { submissionId } = req.body;
 
-  if (!submissionId) {
-    return res.status(400).json({ error: 'Missing submissionId for CV tailoring.' });
-  }
+    try {
+      // Try to get from cache first
+      let submissionData = await cacheUtils.getSubmission(submissionId);
+      
+      if (!submissionData) {
+        // Fetch from database with timeout
+        submissionData = await dbUtils.queryWithTimeout(async () => {
+          const { data, error } = await supabase
+            .from('cv_submissions')
+            .select('original_cv_text, job_spec_text')
+            .eq('id', submissionId)
+            .single();
 
-  try {
-    // Fetch the stored original CV text and job spec text from the database
-    const { data: submissionData, error: fetchError } = await supabase
-      .from('cv_submissions')
-      .select('original_cv_text, job_spec_text')
-      .eq('id', submissionId)
-      .single();
+          if (error) throw error;
+          return data;
+        });
 
-    if (fetchError || !submissionData) {
-      console.error('Error fetching submission data:', fetchError);
-      return res.status(500).json({ error: 'Failed to fetch submission data for tailoring.' });
-    }
+        // Cache the result
+        await cacheUtils.cacheSubmission(submissionId, submissionData);
+      }
 
-    const originalCvContent = submissionData.original_cv_text;
-    const jobSpecContent = submissionData.job_spec_text;
+      const originalCvContent = submissionData.original_cv_text;
+      const jobSpecContent = submissionData.job_spec_text;
 
-    if (!originalCvContent || !jobSpecContent) {
-      return res.status(400).json({ error: 'Missing original CV content or job spec content in database for tailoring.' });
-    }
+      if (!originalCvContent || !jobSpecContent) {
+        return res.status(400).json({ error: 'Missing original CV content or job spec content in database for tailoring.' });
+      }
 
-    // Prompt for OpenRouter using the defined template
-    const prompt = `**ABSOLUTELY CRITICAL: Your top priority is to make this CV match the Job Specification as closely as possible. Every sentence and phrase should be rephrased to align perfectly with the tone, keywords, and requirements of the Job Specification, using its exact language where appropriate. Focus intensely on relevance and direct keyword integration.**
+      // Add to processing queue for better scalability
+      const job = await queueUtils.addCvProcessingJob(submissionId, originalCvContent, jobSpecContent);
+
+      // Generate the prompt with an explicit instruction for valid JSON
+      const prompt = `**ABSOLUTELY CRITICAL: Your top priority is to make this CV match the Job Specification as closely as possible. Every sentence and phrase should be rephrased to align perfectly with the tone, keywords, and requirements of the Job Specification, using its exact language where appropriate. Focus intensely on relevance and direct keyword integration.**
 
 **LINGUISTIC ALIGNMENT DIRECTIVES:**
 1. **Vocabulary Mirroring:** Use the EXACT same technical terms, industry jargon, and key phrases found in the Job Specification. Do not paraphrase or use synonyms - adopt the precise terminology.
@@ -238,6 +365,8 @@ You are a professional CV tailoring assistant. Your overarching goal is to creat
 4.  **Education:** Extract and present your educational background from the Original CV (or its equivalent section). Adapt wording if necessary to align with professional tone, but do not alter factual information.
 5.  **Skills:** Review all relevant skills sections from the Original CV (e.g., 'Skills', 'Technical Skills', 'Core Competencies', 'Abilities'). Actively select and list ONLY those skills that are directly relevant and explicitly mentioned or strongly implied by the Job Specification. For technical skills, use precise terminology. For soft skills, articulate them in a way that resonates with the job description. Ensure strong alignment with the language used in the Job Specification. Do NOT include any skills that are not present in your Original CV. **Prioritize skills that are explicitly stated or strongly implied as essential in the Job Specification, and use the Job Specification's phrasing for these skills where possible, but do not invent or exaggerate.**
 
+IMPORTANT: Your output MUST be a single, complete, valid JSON object matching the provided structure. Do NOT include any extra text, comments, or explanations. Do NOT cut off the JSON. If you cannot fill a field, use an empty string or array.
+
 Original CV:
 ${originalCvContent}
 
@@ -249,102 +378,169 @@ ${JSON.stringify(cvTemplateJSONStructure, null, 2)}
 
 Tailored CV (JSON output ONLY):`;
 
-    console.log("Content sent to AI:");
-    console.log("Original CV Content (from DB):", originalCvContent);
-    console.log("Job Spec Content (from DB):", jobSpecContent);
+      logger.info('Starting CV tailoring', { submissionId, ip: req.ip, jobId: job.id });
 
-    const { text: tailoredCvJsonString } = await generateText({
-      model: openrouter('anthropic/claude-3-opus'), // Switched to Claude 3 Opus for better tailoring
-      prompt: prompt,
-      max_tokens: 2000, // Increased max_tokens to accommodate detailed CVs
-    });
+      let tailoredCvData = null;
+      let lastAiOutput = '';
+      let aiError = null;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        const { text: tailoredCvJsonString } = await generateText({
+          model: openrouter('anthropic/claude-3-opus'),
+          prompt: prompt,
+          max_tokens: 1800,
+        });
+        lastAiOutput = tailoredCvJsonString;
+        try {
+          tailoredCvData = JSON.parse(tailoredCvJsonString);
+          aiError = null;
+          break;
+        } catch (parseError) {
+          aiError = parseError;
+          logger.error('AI output not valid JSON', {
+            error: parseError.message,
+            submissionId,
+            attempt,
+            aiOutput: tailoredCvJsonString.substring(0, 1000) // Log first 1000 chars
+          });
+        }
+      }
+      if (!tailoredCvData) {
+        logger.error('Failed to get valid JSON from AI after 3 attempts', {
+          submissionId,
+          lastAiOutput: lastAiOutput.substring(0, 1000),
+          aiError: aiError ? aiError.message : undefined
+        });
+        return res.status(500).json({ error: 'AI failed to generate a valid CV. Please try again.' });
+      }
 
-    console.log("Raw Tailored CV JSON String from AI:", tailoredCvJsonString);
-
-    let tailoredCvData;
-    try {
-        tailoredCvData = JSON.parse(tailoredCvJsonString);
-        console.log("Parsed Tailored CV Data (JavaScript Object):");
-        console.log(tailoredCvData); // Log the parsed object
-    } catch (parseError) {
-        console.error('Error parsing tailored CV JSON from AI:', parseError);
-        console.error('AI Output that failed to parse:', tailoredCvJsonString);
-        return res.status(500).json({ error: 'Failed to parse AI-generated CV content.' });
-    }
-
-    // Ensure skills are arrays for bullet point rendering
-    if (typeof tailoredCvData.technical_skills === 'string') {
+      // Ensure skills are arrays for bullet point rendering
+      if (typeof tailoredCvData.technical_skills === 'string') {
         tailoredCvData.technical_skills = tailoredCvData.technical_skills
-            .split(',')
-            .map(s => s.trim())
-            .filter(Boolean);
-    }
-    if (typeof tailoredCvData.soft_skills === 'string') {
+          .split(',')
+          .map(s => s.trim())
+          .filter(Boolean);
+      }
+      if (typeof tailoredCvData.soft_skills === 'string') {
         tailoredCvData.soft_skills = tailoredCvData.soft_skills
-            .split(',')
-            .map(s => s.trim())
-            .filter(Boolean);
+          .split(',')
+          .map(s => s.trim())
+          .filter(Boolean);
+      }
+
+      // Read the HTML template file
+      const htmlTemplatePath = path.join(__dirname, 'cv_template.html');
+      const htmlTemplate = await fs.readFile(htmlTemplatePath, 'utf8');
+
+      // Compile the Handlebars template
+      const template = Handlebars.compile(htmlTemplate);
+
+      // Render the HTML with the tailored CV data
+      const renderedHtml = template(tailoredCvData);
+
+      // Generate PDF from the rendered HTML
+      const browser = await puppeteer.launch({
+        headless: true,
+        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+        protocolTimeout: 120000
+      });
+      const page = await browser.newPage();
+      await page.setContent(renderedHtml, { waitUntil: 'networkidle0' });
+      const pdfBuffer = await page.pdf({ format: 'A4', printBackground: true });
+      await browser.close();
+
+      logger.info('CV tailoring completed successfully', { submissionId, ip: req.ip });
+
+      // Log before sending PDF
+      logger.info('Sending tailored PDF response', {
+        submissionId,
+        headers: {
+          'Content-Type': 'application/pdf',
+          'Content-Disposition': 'attachment; filename=tailored_cv.pdf'
+        }
+      });
+
+      // Send the PDF as a file download
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', 'attachment; filename=tailored_cv.pdf');
+      res.send(pdfBuffer);
+
+    } catch (error) {
+      logger.error('Server error during CV tailoring or PDF generation:', {
+        error: error.message,
+        stack: error.stack,
+        submissionId,
+        // If response object exists, log headers and status
+        responseHeaders: res.getHeaders ? res.getHeaders() : undefined,
+        responseStatus: res.statusCode
+      });
+      res.status(500).json({ error: 'Internal server error.' });
     }
-
-    // Read the HTML template file
-    const htmlTemplatePath = path.join(__dirname, 'cv_template.html');
-    const htmlTemplate = await fs.readFile(htmlTemplatePath, 'utf8');
-
-    // Compile the Handlebars template
-    const template = Handlebars.compile(htmlTemplate);
-
-    // Render the HTML with the tailored CV data
-    const renderedHtml = template(tailoredCvData);
-    console.log("Rendered HTML (before PDF generation):");
-    console.log(renderedHtml); // Log the rendered HTML
-
-    // Generate PDF from the rendered HTML
-    const browser = await puppeteer.launch({
-        headless: true, // Use headless mode for production
-        args: ['--no-sandbox', '--disable-setuid-sandbox']
-    });
-    const page = await browser.newPage();
-    await page.setContent(renderedHtml, { waitUntil: 'networkidle0' });
-    const pdfBuffer = await page.pdf({ format: 'A4', printBackground: true });
-    await browser.close();
-
-    // Send the PDF as a file download
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', 'attachment; filename=tailored_cv.pdf');
-    res.send(pdfBuffer);
-
-  } catch (error) {
-    console.error('Server error during CV tailoring or PDF generation:', error);
-    res.status(500).json({ error: 'Internal server error.' });
   }
-});
+);
 
-// Add a route to fetch a submission by ID for display
-app.get('/submission/:id', async (req, res) => {
+// Add a route to fetch a submission by ID for display (with caching)
+app.get('/submission/:id', cacheMiddleware(1800), async (req, res) => {
   const { id } = req.params;
   try {
-    const { data, error } = await supabase
-      .from('cv_submissions')
-      .select('*')
-      .eq('id', id)
-      .single();
-
-    if (error) {
-      console.error('Error fetching submission:', error);
-      return res.status(500).json({ error: 'Failed to fetch submission.' });
-    }
-
+    // Try cache first
+    let data = await cacheUtils.getSubmission(id);
+    
     if (!data) {
-      return res.status(404).json({ error: 'Submission not found.' });
+      // Fetch from database with timeout
+      data = await dbUtils.queryWithTimeout(async () => {
+        const { data, error } = await supabase
+          .from('cv_submissions')
+          .select('*')
+          .eq('id', id)
+          .single();
+
+        if (error) throw error;
+        return data;
+      });
+
+      if (!data) {
+        return res.status(404).json({ error: 'Submission not found.' });
+      }
+
+      // Cache the result
+      await cacheUtils.cacheSubmission(id, data);
     }
 
     res.status(200).json(data);
   } catch (error) {
-    console.error('Server error fetching submission:', error);
+    logger.error('Server error fetching submission:', { error: error.message, id });
     res.status(500).json({ error: 'Internal server error.' });
   }
 });
 
+// Error handling middleware (must be last)
+app.use(errorLogger);
+app.use(errorHandler);
+
+// Start scheduled health checks
+scheduleHealthChecks();
+
+// Graceful shutdown
+const gracefulShutdown = async () => {
+  logger.info('Shutting down server gracefully...');
+  
+  // Close queues
+  await queueShutdown();
+  
+  // Close database connections
+  // (Supabase handles this automatically)
+  
+  process.exit(0);
+};
+
+process.on('SIGTERM', gracefulShutdown);
+process.on('SIGINT', gracefulShutdown);
+
 app.listen(port, () => {
-  console.log(`Server running on port ${port}`);
+  logger.info(`Server started successfully`, { 
+    port, 
+    environment: config.nodeEnv,
+    timestamp: new Date().toISOString(),
+    worker: process.pid
+  });
 }); 
